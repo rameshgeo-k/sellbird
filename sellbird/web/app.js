@@ -408,6 +408,7 @@ function showTab(id, btn) {
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if (btn) btn.classList.add('active');
+  try { history.replaceState(null, '', '#' + id); } catch {}
   loadCurrentTab();
 }
 
@@ -1655,6 +1656,24 @@ async function loadOutbox() {
   }
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
+  // Merge history arrays; a row can appear in multiple arrays when its status
+  // transitions between API calls, so deduplicate by id keeping the most
+  // terminal status (sent > failed > scheduled).
+  const _hRank = {sent: 2, failed: 1, scheduled: 0};
+  const _hMap = new Map();
+  for (const [arr, hstatus] of [
+    [data.approved || [], 'scheduled'],
+    [data.sent     || [], 'sent'],
+    [data.failed   || [], 'failed'],
+  ]) {
+    for (const r of arr) {
+      const existing = _hMap.get(r.id);
+      if (!existing || _hRank[hstatus] > _hRank[existing._hstatus]) {
+        _hMap.set(r.id, {...r, _hstatus: hstatus});
+      }
+    }
+  }
+  _outboxHistory = [..._hMap.values()].map((r, i) => ({...r, _hix: i}));
 
   actions.innerHTML =
     (pending.length && !data.paused
@@ -1682,38 +1701,8 @@ async function loadOutbox() {
         '<p>' + escHtml(data.compliance_notice) + '</p></div></div>';
   }
 
-  desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
-    '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
-      _sendingMode && _sendingMode.mode === 'autopilot'
-        ? 'Autopilot is on, so Sellbird sends on its own. Anything it holds for you shows up here.'
-        : 'Every draft Sellbird writes lands here first. Approve one and it sends on schedule.') +
-    '</div>';
-
-  const table = (title, rows, cols) => {
-    if (!rows || !rows.length) return '';
-    let h = '<div class="subhead">' + title + ' <span class="hint">' + rows.length + '</span></div>' +
-      '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
-      cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
-    for (const r of rows) {
-      h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
-        (c[3] ? c[1](r) : escHtml(String(c[1](r) ?? ''))) + '</td>').join('') + '</tr>';
-    }
-    return h + '</tbody></table></div>';
-  };
-
-  list.innerHTML =
-    table('Approved &amp; scheduled', data.approved, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
-    ]) +
-    table('Recently sent', data.sent, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sent', r => formatDate(r.sent_at), true],
-    ]) +
-    table('Didn\'t send', data.failed, [
-      ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
-      ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
-    ]);
+  renderOutboxPending();
+  renderOutboxHistory();
 }
 
 const CONTACT_SOURCES = {
@@ -1761,6 +1750,7 @@ function renderDeskContext(ctx) {
 // own, and still holds what gate.autopilot_review flags. Turning autopilot
 // on takes typing the word; turning it off is one click and works at once.
 let _sendingMode = null, _autopilotArmed = false, _modeBusy = false;
+let _outboxView = 'desk', _outboxHistoryFilter = 'all', _outboxHistory = [], _outboxHistoryPage = 0;
 
 function sendingModeBanner(m) {
   if (!m) return '';
@@ -1869,15 +1859,23 @@ function heldReason(item) {
 
 function renderDesk(items, i) {
   const cur = items[i];
+
+  // Rail: each item shows name + step badge + held dot, subject, scheduled time
   const rail = items.map((it, n) => {
     const who = it.context && it.context.contact ? it.context.contact : it.to_email;
     const parts = String(who || '').split(/[\s@.]+/);
-    return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
+    const step = it.kind === 'reply' ? 'Reply' : 'E' + it.step;
+    const held = heldReason(it);
+    return '<div class="desk-item ' + (n === i ? 'active' : '') + (held ? ' held-item' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
-      '<div class="di-text"><div class="to">' + escHtml(who) +
-        (heldReason(it) ? ' <span class="tag t-bad" title="Sellbird held this instead of sending it">Held</span>' : '') +
+      '<div class="di-text">' +
+        '<div class="di-row1"><span class="to">' + escHtml(who) + '</span>' +
+          '<span class="di-step">' + escHtml(step) + '</span>' +
+          (held ? '<span class="di-held-dot" title="Held by autopilot"></span>' : '') +
         '</div>' +
-      '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
+        '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div>' +
+        (it.send_at ? '<div class="di-when">' + escHtml(formatDate(it.send_at)) + '</div>' : '') +
+      '</div>' +
     '</div>';
   }).join('');
 
@@ -1886,20 +1884,37 @@ function renderDesk(items, i) {
   // A reply keeps its subject: Gmail threads by it.
   const fixedSubject = cur.kind === 'reply'
     ? ' readonly title="A reply keeps its subject so it stays in the thread"' : '';
-  const draft = editing
-    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
-        fixedSubject + ' oninput="deskKeep()">' +
-      '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
-        escHtml(unsaved.body) + '</textarea>'
-    : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
-      '<div class="body">' + escHtml(cur.body) + '</div>';
+
   // Cold email leaves with the footer underneath; show it as it will go out.
   // Not added again when the body already ends with it, as in the Sender.
   const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
     ? _desk.footer : '';
-  const footer = added
+  const footerHtml = added
     ? '<div class="desk-footer" title="Added when it sends (compliance in sellbird.yaml)">' +
         escHtml(added) + '</div>' : '';
+
+  // Email frame: subject in a header band, body below — looks like a draft
+  const emailHtml = editing
+    ? '<div class="email-frame editing">' +
+        '<div class="ef-header">' +
+          '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
+            fixedSubject + ' oninput="deskKeep()">' +
+        '</div>' +
+        '<div class="ef-body">' +
+          '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
+            escHtml(unsaved.body) + '</textarea>' +
+        '</div>' +
+      '</div>'
+    : '<div class="email-frame">' +
+        '<div class="ef-header">' +
+          '<div class="ef-subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
+        '</div>' +
+        '<div class="ef-body">' +
+          '<div class="body">' + escHtml(cur.body) + '</div>' +
+          footerHtml +
+        '</div>' +
+      '</div>';
+
   const actions = editing
     ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
@@ -1907,33 +1922,282 @@ function renderDesk(items, i) {
         'Approve <kbd>A</kbd></button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
         'Edit <kbd>E</kbd></button>' +
-      '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
+      '<button class="btn btn-ghost desk-reject" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
         'Reject <kbd>R</kbd></button>';
+
+  const nav = '<div class="desk-nav" role="group" aria-label="Navigate drafts">' +
+    '<button class="btn btn-ghost btn-sm" onclick="deskGo(' + (i - 1) + ')" aria-label="Previous"' +
+      (i === 0 ? ' disabled' : '') + '>&#8592;</button>' +
+    '<span class="desk-nav-count">' + (i + 1) + ' / ' + items.length + '</span>' +
+    '<button class="btn btn-ghost btn-sm" onclick="deskGo(' + (i + 1) + ')" aria-label="Next"' +
+      (i === items.length - 1 ? ' disabled' : '') + '>&#8594;</button>' +
+    '</div>';
 
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
         '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
-        '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
+        '<span class="muted">sends ' + escHtml(formatDate(cur.send_at)) + '</span>' +
+      '</div>' +
+      (cur.context ? '<div class="desk-context-head">About this contact</div>' : '') +
       renderDeskContext(cur.context) +
       (heldReason(cur)
         ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>Sellbird held this instead of sending it</b>' +
           '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
           'email can try to steer what Sellbird writes.</div></div></div>'
         : '') +
-      draft + footer +
-      '<div class="desk-actions">' + actions +
-        '<span class="muted" style="font-size:12px;margin-left:auto">' +
-          (i + 1) + ' of ' + items.length + '</span>' +
+      emailHtml +
+      '<div class="desk-actions">' + actions + nav + '</div>' +
+    '</div></div>';
+}
+
+function renderOutboxPending() {
+  const desk = document.getElementById('outbox-desk');
+  if (!desk) return;
+  const pending = _desk.items;
+  if (!pending.length) {
+    desk.innerHTML = '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
+      _sendingMode && _sendingMode.mode === 'autopilot'
+        ? 'Autopilot is on, so Sellbird sends on its own. Anything it holds for you shows up here.'
+        : 'Every draft Sellbird writes lands here first. Approve one and it sends on schedule.') +
+      '</div>';
+    return;
+  }
+  const toggle = '<div class="toolbar">' +
+    '<div class="segmented" role="group" aria-label="View pending as">' +
+    '<button class="' + (_outboxView === 'desk' ? 'on' : '') + '" ' +
+      'onclick="_outboxView=\'desk\';renderOutboxPending()">Review</button>' +
+    '<button class="' + (_outboxView === 'table' ? 'on' : '') + '" ' +
+      'onclick="_outboxView=\'table\';renderOutboxPending()">Table</button>' +
+    '</div></div>';
+  desk.innerHTML = toggle + (_outboxView === 'table'
+    ? renderOutboxTable(pending)
+    : renderDesk(pending, _desk.i));
+}
+
+function renderOutboxTable(items) {
+  let h = '<div class="table-card"><table><thead><tr>' +
+    '<th>Recipient</th><th>Subject &amp; preview</th><th>Step</th><th>Email</th><th>Sends</th><th></th>' +
+    '</tr></thead><tbody>';
+  for (const it of items) {
+    const who = it.context && it.context.contact ? it.context.contact : it.to_email;
+    const emailStatus = it.context ? (it.context.email_status || '') : '';
+    const step = it.kind === 'reply' ? 'Reply' : 'E' + (it.step || '');
+    const held = heldReason(it);
+    const snippet = (it.body || '').replace(/\n+/g, ' ').trim().slice(0, 90);
+    h += '<tr class="ot-row' + (held ? ' ot-held' : '') + '" onclick="openOutboxItem(' + jsq(it.id) + ')" title="Click to read">' +
+      '<td class="ot-recipient"><div class="ot-who">' + escHtml(who) + '</div>' +
+        (who !== it.to_email ? '<div class="ot-addr">' + escHtml(it.to_email) + '</div>' : '') +
+      '</td>' +
+      '<td><div class="ot-subject">' + escHtml(it.subject || '(no subject)') + '</div>' +
+        (snippet ? '<div class="snippet">' + escHtml(snippet) + (snippet.length >= 90 ? '…' : '') + '</div>' : '') +
+      '</td>' +
+      '<td><span class="di-step">' + escHtml(step) + '</span></td>' +
+      '<td>' + (emailStatus ? badge(emailStatus) : '') + '</td>' +
+      '<td class="muted">' + escHtml(formatDate(it.send_at)) + '</td>' +
+      '<td class="ot-acts" onclick="event.stopPropagation()"><div class="ot-btn-group">' +
+        (held ? badge('pending_review') + ' ' : '') +
+        '<button class="btn btn-primary btn-sm" onclick="outboxAct(' + jsq(it.id) + ',\'approve\')">Approve</button>' +
+        '<button class="btn btn-ghost btn-sm desk-reject" onclick="outboxAct(' + jsq(it.id) + ',\'reject\')">Reject</button>' +
+      '</div></td>' +
+    '</tr>';
+  }
+  return h + '</tbody></table></div>';
+}
+
+function renderOutboxHistory() {
+  const el = document.getElementById('outbox-list');
+  if (!el) return;
+  if (!_outboxHistory.length) { el.innerHTML = ''; return; }
+
+  const PAGE = 25;
+  const counts = {all: _outboxHistory.length, scheduled: 0, sent: 0, failed: 0};
+  for (const r of _outboxHistory) counts[r._hstatus] = (counts[r._hstatus] || 0) + 1;
+
+  const filtered = _outboxHistoryFilter === 'all'
+    ? _outboxHistory
+    : _outboxHistory.filter(r => r._hstatus === _outboxHistoryFilter);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE));
+  if (_outboxHistoryPage >= totalPages) _outboxHistoryPage = totalPages - 1;
+
+  let h = '<div class="subhead">History</div>' +
+    '<div class="toolbar">' +
+    '<div class="segmented" role="group" aria-label="Filter history">' +
+    [['all', 'All'], ['scheduled', 'Scheduled'], ['sent', 'Sent'], ['failed', 'Failed']].map(([f, label]) =>
+      '<button class="' + (_outboxHistoryFilter === f ? 'on' : '') + '" ' +
+      'onclick="_outboxHistoryFilter=\'' + f + '\';_outboxHistoryPage=0;renderOutboxHistory()">' +
+      label + ' <span class="n">' + (counts[f] || 0) + '</span></button>'
+    ).join('') +
+    '</div></div>';
+
+  if (!filtered.length) {
+    h += '<div class="muted" style="padding:var(--sp-5) 0;text-align:center;font-size:var(--fs-ui)">No ' +
+      escHtml(_outboxHistoryFilter) + ' emails</div>';
+    el.innerHTML = h;
+    return;
+  }
+
+  const start = _outboxHistoryPage * PAGE;
+  const end   = Math.min(start + PAGE, filtered.length);
+  const page  = filtered.slice(start, end);
+
+  h += '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
+    '<th>Recipient</th><th>Subject</th><th>Step</th><th>Status</th><th>Time</th><th></th>' +
+    '</tr></thead><tbody>';
+  for (const r of page) {
+    const step = r.kind === 'reply' ? 'Reply' : (r.step ? 'E' + r.step : '');
+    const time = r._hstatus === 'sent' ? r.sent_at
+      : r._hstatus === 'scheduled' ? r.send_at : r.updated_at;
+    const statusHtml = r._hstatus === 'failed'
+      ? badge(r.status)
+      : badge(r._hstatus === 'scheduled' ? (r.status || 'scheduled') : 'sent');
+    h += '<tr>' +
+      '<td>' + escHtml(r.to_email) + '</td>' +
+      '<td class="clip">' + escHtml(r.subject || '—') + '</td>' +
+      '<td>' + (step ? '<span class="di-step">' + escHtml(step) + '</span>' : '—') + '</td>' +
+      '<td>' + statusHtml + '</td>' +
+      '<td class="muted">' + escHtml(formatDate(time)) + '</td>' +
+      '<td><button class="btn btn-ghost btn-sm" onclick="openHistoryItem(' + r._hix + ')">View</button></td>' +
+      '</tr>';
+  }
+  h += '</tbody></table></div>';
+
+  if (totalPages > 1) {
+    h += '<div class="pager">' +
+      '<button class="btn btn-ghost btn-sm" onclick="_outboxHistoryPage--; renderOutboxHistory()"' +
+        (_outboxHistoryPage === 0 ? ' disabled' : '') + '>← Prev</button>' +
+      '<span class="pager-info">' + (start + 1) + '–' + end + ' of ' + filtered.length + '</span>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_outboxHistoryPage++; renderOutboxHistory()"' +
+        (_outboxHistoryPage >= totalPages - 1 ? ' disabled' : '') + '>Next →</button>' +
+      '</div>';
+  }
+
+  el.innerHTML = h;
+}
+
+function openOutboxItem(id) {
+  const it = _desk.items.find(item => item.id === id);
+  if (!it) return;
+  const held = heldReason(it);
+  const added = it.kind === 'sequence' && !(it.body || '').trimEnd().endsWith(_desk.footer)
+    ? _desk.footer : '';
+  const footerHtml = added
+    ? '<div class="desk-footer" title="Added when it sends (compliance in sellbird.yaml)">' + escHtml(added) + '</div>' : '';
+
+  const html =
+    '<div class="ob-modal" onclick="if(event.target===this)closeOutboxModal()" role="dialog" aria-modal="true">' +
+    '<div class="ob-modal-inner">' +
+      '<div class="ob-modal-head">' +
+        '<div class="to-line">To <b>' + escHtml(it.to_email) + '</b>' +
+          '<span class="tag">' + (it.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(it.step))) + '</span>' +
+          '<span class="muted">sends ' + escHtml(formatDate(it.send_at)) + '</span>' +
+        '</div>' +
+        '<button class="btn btn-ghost btn-sm" onclick="closeOutboxModal()" aria-label="Close" style="flex-shrink:0">×</button>' +
+      '</div>' +
+      '<div class="ob-modal-body">' +
+        (it.context ? '<div class="desk-context-head">About this contact</div>' : '') +
+        renderDeskContext(it.context) +
+        (held ? '<div class="banner wait desk-held">' + icon('alert') +
+          '<div><b>Sellbird held this instead of sending it</b>' +
+          '<div>' + escHtml(held) + '. Read it before approving: text from a website or an email can try to steer what Sellbird writes.</div>' +
+          '</div></div>' : '') +
+        '<div class="email-frame">' +
+          '<div class="ef-header"><div class="ef-subject">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
+          '<div class="ef-body"><div class="body">' + escHtml(it.body) + '</div>' + footerHtml + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="ob-modal-foot">' +
+        '<button class="btn btn-primary" onclick="outboxAct(' + jsq(it.id) + ',\'approve\');closeOutboxModal()">Approve</button>' +
+        '<button class="btn btn-secondary" onclick="outboxModalEdit(' + jsq(it.id) + ')">Edit</button>' +
+        '<button class="btn btn-ghost desk-reject" onclick="outboxAct(' + jsq(it.id) + ',\'reject\');closeOutboxModal()">Reject</button>' +
+        '<span class="muted" style="margin-left:auto;font-size:var(--fs-caption)">Esc to close</span>' +
       '</div>' +
     '</div></div>';
+
+  let host = document.getElementById('ob-modal-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'ob-modal-host';
+    document.body.appendChild(host);
+  }
+  host.innerHTML = html;
+  document.addEventListener('keydown', obModalKeyHandler);
+}
+
+function closeOutboxModal() {
+  const host = document.getElementById('ob-modal-host');
+  if (host) host.innerHTML = '';
+  document.removeEventListener('keydown', obModalKeyHandler);
+}
+
+function obModalKeyHandler(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeOutboxModal(); }
+}
+
+function outboxModalEdit(id) {
+  closeOutboxModal();
+  const idx = _desk.items.findIndex(it => it.id === id);
+  if (idx < 0) return;
+  _outboxView = 'desk';
+  _desk.i = idx;
+  deskEdit(id);
+}
+
+function openHistoryItem(hix) {
+  const r = _outboxHistory[hix];
+  if (!r) return;
+  const step = r.kind === 'reply' ? 'Reply' : (r.step ? 'E' + r.step : '');
+  const time = r._hstatus === 'sent' ? r.sent_at
+    : r._hstatus === 'scheduled' ? r.send_at : r.updated_at;
+  const statusHtml = r._hstatus === 'failed'
+    ? badge(r.status)
+    : badge(r._hstatus === 'scheduled' ? (r.status || 'scheduled') : 'sent');
+
+  const html =
+    '<div class="ob-modal" onclick="if(event.target===this)closeOutboxModal()" role="dialog" aria-modal="true">' +
+    '<div class="ob-modal-inner">' +
+      '<div class="ob-modal-head">' +
+        '<div class="to-line">To <b>' + escHtml(r.to_email) + '</b>' +
+          (step ? '<span class="tag">' + escHtml(step) + '</span>' : '') +
+          statusHtml +
+        '</div>' +
+        '<button class="btn btn-ghost btn-sm" onclick="closeOutboxModal()" aria-label="Close" style="flex-shrink:0">×</button>' +
+      '</div>' +
+      '<div class="ob-modal-body">' +
+        (r.error ? '<div class="banner bad" style="margin-bottom:var(--sp-4)">' + icon('alert') +
+          '<div><b>' + escHtml(badge(r.status).replace(/<[^>]+>/g,'')) + '</b><div style="white-space:pre-wrap;overflow-wrap:anywhere">' + escHtml(r.error) + '</div></div></div>' : '') +
+        (r.body
+          ? '<div class="email-frame">' +
+              '<div class="ef-header"><div class="ef-subject">' + escHtml(r.subject || '(no subject)') + '</div></div>' +
+              '<div class="ef-body"><div class="body">' + escHtml(r.body) + '</div></div>' +
+            '</div>'
+          : '<div class="desk-context">' +
+              (r.subject ? '<div class="k">Subject</div><div class="v"><b>' + escHtml(r.subject) + '</b></div>' : '') +
+              '<div class="k">Time</div><div class="v">' + escHtml(formatDate(time)) + '</div>' +
+            '</div>') +
+      '</div>' +
+      '<div class="ob-modal-foot">' +
+        '<button class="btn btn-secondary" onclick="closeOutboxModal()">Close</button>' +
+        '<span class="muted" style="margin-left:auto;font-size:var(--fs-caption)">Esc to close</span>' +
+      '</div>' +
+    '</div></div>';
+
+  let host = document.getElementById('ob-modal-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'ob-modal-host';
+    document.body.appendChild(host);
+  }
+  host.innerHTML = html;
+  document.addEventListener('keydown', obModalKeyHandler);
 }
 
 function deskEdit(id) {
   _desk.editing = id;
   _desk.unsaved = null;
-  document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
+  renderOutboxPending();
   if (id) document.getElementById('desk-body').focus();
 }
 
@@ -1979,7 +2243,7 @@ async function deskSave(id) {
 function deskGo(n) {
   if (n < 0 || n >= _desk.items.length || deskBusy()) return;
   _desk.i = n;
-  document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
+  renderOutboxPending();
 }
 
 // Keyboard review. Ignored while typing into a field, so Settings still works.
@@ -2031,6 +2295,7 @@ async function sendingToggle(action) {
 
 const COMPANIES_PER_PAGE = 50;
 let _companiesPage = 0;
+let _companyQuery = '', _companyStatusFilter = 'all', _companyFitFilter = 'all';
 
 async function loadCompanies() {
   companyDrill = false;
@@ -2044,21 +2309,87 @@ async function loadCompanies() {
       'OpenStreetMap is free and needs no account.');
     return;
   }
-  renderCompaniesPage(_companiesPage);
+  renderCompaniesPage(0);
+}
+
+function companyMatches(c) {
+  const q = _companyQuery.trim().toLowerCase();
+  if (q && ![c.name, c.domain, c.industry, c.location].join(' ').toLowerCase().includes(q)) return false;
+  if (_companyStatusFilter !== 'all') {
+    const hasContacts = (c.contact_count || 0) > 0;
+    if (_companyStatusFilter === 'has_contacts' && !hasContacts) return false;
+    if (_companyStatusFilter === 'no_contacts' && hasContacts) return false;
+  }
+  if (_companyFitFilter !== 'all') {
+    const f = typeof c.fit === 'number' ? c.fit : -1;
+    if (_companyFitFilter === 'high' && f < 70) return false;
+    if (_companyFitFilter === 'mid' && (f < 40 || f >= 70)) return false;
+    if (_companyFitFilter === 'low' && (f < 0 || f >= 40)) return false;
+  }
+  return true;
 }
 
 function renderCompaniesPage(page) {
   const el = document.getElementById('companies-list');
-  const data = _companies;
-  const pages = Math.max(1, Math.ceil(data.length / COMPANIES_PER_PAGE));
+  const all = _companies;
+  const filtered = all.filter(companyMatches);
+
+  const FIT_FILTERS = [
+    ['all', 'All fit'],
+    ['high', 'High 70+'],
+    ['mid', 'Mid 40–69'],
+    ['low', 'Low <40'],
+  ];
+  const STATUS_FILTERS = [
+    ['all', 'All'],
+    ['has_contacts', 'Has contacts'],
+    ['no_contacts', 'None yet'],
+  ];
+
+  const toolbar = '<div class="toolbar">' +
+    '<label class="search">' + icon('discover') +
+      '<input class="form-input" id="company-search" type="search" placeholder="Search name, domain, industry" ' +
+      'aria-label="Search companies" oninput="_companyQuery=this.value;renderCompaniesPage(0)" value="' + escHtml(_companyQuery) + '"></label>' +
+    '<div class="segmented" role="group" aria-label="Filter by contacts">' +
+      STATUS_FILTERS.map(f => {
+        const n = f[0] === 'all' ? all.length
+          : f[0] === 'has_contacts' ? all.filter(c => (c.contact_count || 0) > 0).length
+          : all.filter(c => (c.contact_count || 0) === 0).length;
+        return '<button class="' + (f[0] === _companyStatusFilter ? 'on' : '') +
+          '" onclick="_companyStatusFilter=\'' + f[0] + '\';renderCompaniesPage(0)">' +
+          f[1] + ' <span class="n">' + n + '</span></button>';
+      }).join('') +
+    '</div>' +
+    '<div class="segmented" role="group" aria-label="Filter by fit">' +
+      FIT_FILTERS.map(f => {
+        const n = f[0] === 'all' ? all.length
+          : f[0] === 'high' ? all.filter(c => typeof c.fit === 'number' && c.fit >= 70).length
+          : f[0] === 'mid' ? all.filter(c => typeof c.fit === 'number' && c.fit >= 40 && c.fit < 70).length
+          : all.filter(c => typeof c.fit === 'number' && c.fit < 40).length;
+        return '<button class="' + (f[0] === _companyFitFilter ? 'on' : '') +
+          '" onclick="_companyFitFilter=\'' + f[0] + '\';renderCompaniesPage(0)">' +
+          f[1] + (f[0] !== 'all' ? ' <span class="n">' + n + '</span>' : '') + '</button>';
+      }).join('') +
+    '</div>' +
+    '</div>';
+
+  if (!filtered.length) {
+    el.innerHTML = toolbar + '<div class="table-card">' +
+      emptyState(icon('discover'), 'No matches', 'No companies match that search or filter.') + '</div>';
+    return;
+  }
+
+  const pages = Math.max(1, Math.ceil(filtered.length / COMPANIES_PER_PAGE));
   _companiesPage = Math.min(Math.max(0, page), pages - 1);
   const start = _companiesPage * COMPANIES_PER_PAGE;
-  let html = '<div class="table-card"><table class="nowrap"><thead><tr><th>Company</th>' +
+
+  let html = toolbar + '<div class="table-card"><table class="nowrap"><thead><tr><th>Company</th>' +
     '<th title="Company fit, 0-100: sector, decision maker, reachability, buying signal. Hover a score for why.">Fit</th>' +
     '<th title="Hover a status for why the company was or wasn\'t contacted">Status</th>' +
     '<th>Industry</th><th>Location</th><th class="num">Contacts</th><th>Added</th></tr></thead><tbody>';
-  data.slice(start, start + COMPANIES_PER_PAGE).forEach((c, j) => {
-    const i = start + j;
+
+  filtered.slice(start, start + COMPANIES_PER_PAGE).forEach((c) => {
+    const i = all.indexOf(c);
     const website = c.website || (c.domain ? 'https://' + c.domain : '');
     const domain = safeHref(website)
       ? '<a href="' + safeHref(website) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' +
@@ -2075,6 +2406,7 @@ function renderCompaniesPage(page) {
       '<td class="num">' + (c.contact_count || 0) + '</td>' +
       '<td class="muted">' + relTime(c.created_at) + '</td></tr>';
   });
+
   const pager = pages > 1
     ? ' &nbsp; <button class="btn btn-ghost btn-sm" ' + (_companiesPage === 0 ? 'disabled ' : '') +
         'onclick="renderCompaniesPage(' + (_companiesPage - 1) + ')">&larr; Prev</button> ' +
@@ -2082,9 +2414,11 @@ function renderCompaniesPage(page) {
       ' <button class="btn btn-ghost btn-sm" ' + (_companiesPage >= pages - 1 ? 'disabled ' : '') +
         'onclick="renderCompaniesPage(' + (_companiesPage + 1) + ')">Next &rarr;</button>'
     : '';
+
   el.innerHTML = html + '</tbody></table></div>' +
-    '<div class="table-foot">' + (start + 1) + '–' + Math.min(start + COMPANIES_PER_PAGE, data.length) +
-    ' of ' + data.length + ' compan' + (data.length === 1 ? 'y' : 'ies') + pager + '</div>';
+    '<div class="table-foot">' + (start + 1) + '–' + Math.min(start + COMPANIES_PER_PAGE, filtered.length) +
+    ' of ' + filtered.length + ' compan' + (filtered.length === 1 ? 'y' : 'ies') +
+    (filtered.length < all.length ? ' (filtered from ' + all.length + ')' : '') + pager + '</div>';
 }
 
 // Basic facts about one company, above its contacts: where it came from,
@@ -2190,7 +2524,7 @@ function fbCampaign(i) {
 
 // Search and status filter live outside the table, so the 15-second refresh
 // re-renders rows without losing what you typed.
-let _contactQuery = '', _contactFilter = 'all';
+let _contactQuery = '', _contactFilter = 'all', _contactEmailFilter = 'all', _contactSourceFilter = 'all';
 const CONTACT_FILTERS = [
   ['all', 'All', null],
   ['todo', 'To write', ['new', 'queued']],
@@ -2215,7 +2549,12 @@ async function loadProspects() {
         '<input class="form-input" id="contact-search" type="search" placeholder="Search name, company, email" ' +
         'aria-label="Search contacts" oninput="_contactQuery=this.value;renderContacts()"></label>' +
       '<div class="segmented" id="contact-filters" role="group" aria-label="Filter by status"></div>' +
-      '</div><div id="contact-rows"></div>';
+      '</div>' +
+      '<div class="toolbar">' +
+      '<div class="segmented" id="contact-email-filters" role="group" aria-label="Filter by email status"></div>' +
+      '<div class="segmented" id="contact-source-filters" role="group" aria-label="Filter by source"></div>' +
+      '</div>' +
+      '<div id="contact-rows"></div>';
     // A rebuild after an offline blip must show the search still applied.
     document.getElementById('contact-search').value = _contactQuery;
   }
@@ -2243,7 +2582,49 @@ function renderContacts() {
       f[1] + ' <span class="n">' + _prospects.filter(p => contactMatches(p, f[0]) && found(p)).length + '</span></button>'
   ).join('');
 
-  const rows = _prospects.map((p, i) => [p, i]).filter(([p]) => contactMatches(p, _contactFilter) && found(p));
+  // Email status filter
+  const emailFiltersEl = document.getElementById('contact-email-filters');
+  if (emailFiltersEl) {
+    const EMAIL_FILTERS = [
+      ['all', 'All'],
+      ['verified', 'Verified'],
+      ['risky', 'Catch-all'],
+      ['guess', 'Unverified'],
+      ['invalid', 'Invalid'],
+    ];
+    emailFiltersEl.innerHTML = EMAIL_FILTERS.map(f => {
+      const n = f[0] === 'all' ? _prospects.filter(p => contactMatches(p, _contactFilter) && found(p)).length
+        : _prospects.filter(p => contactMatches(p, _contactFilter) && found(p) && p.email_status === f[0]).length;
+      return '<button class="' + (f[0] === _contactEmailFilter ? 'on' : '') +
+        '" aria-pressed="' + (f[0] === _contactEmailFilter) + '" onclick="_contactEmailFilter=\'' + f[0] + '\';renderContacts()">' +
+        f[1] + ' <span class="n">' + n + '</span></button>';
+    }).join('');
+  }
+
+  // Source filter — show unique sources present in filtered data
+  const sourceFiltersEl = document.getElementById('contact-source-filters');
+  if (sourceFiltersEl) {
+    const basePros = _prospects.filter(p => contactMatches(p, _contactFilter) && found(p));
+    const sources = [...new Set(basePros.map(p => p.source).filter(Boolean))].slice(0, 5);
+    if (sources.length > 1) {
+      sourceFiltersEl.innerHTML =
+        '<button class="' + ('all' === _contactSourceFilter ? 'on' : '') +
+        '" onclick="_contactSourceFilter=\'all\';renderContacts()">All sources</button>' +
+        sources.map(s =>
+          '<button class="' + (s === _contactSourceFilter ? 'on' : '') +
+          '" onclick="_contactSourceFilter=' + jsq(s) + ';renderContacts()">' +
+          escHtml(sourceLabel(s)) + ' <span class="n">' + basePros.filter(p => p.source === s).length + '</span></button>'
+        ).join('');
+    } else {
+      sourceFiltersEl.innerHTML = '';
+    }
+  }
+
+  const rows = _prospects.map((p, i) => [p, i]).filter(([p]) =>
+    contactMatches(p, _contactFilter) && found(p) &&
+    (_contactEmailFilter === 'all' || p.email_status === _contactEmailFilter) &&
+    (_contactSourceFilter === 'all' || p.source === _contactSourceFilter)
+  );
   if (!rows.length) {
     rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), 'No matches',
       'Nothing matches that search and filter.') + '</div>';
@@ -2475,8 +2856,35 @@ async function loadCampaigns() {
       'The Writer agent hasn\'t drafted any sequences. It kicks in automatically once Sellbird has scored prospects to write for.');
     return;
   }
-  let html = '';
-  data.forEach((c, i) => {
+  renderCampaigns();
+}
+
+function renderCampaigns() {
+  const el = document.getElementById('campaigns-list');
+  if (!el || !_campaigns.length) return;
+  const CAMP_FILTERS = [
+    ['all', 'All'],
+    ['active', 'Active'],
+    ['draft', 'Draft'],
+    ['paused', 'Paused'],
+    ['completed', 'Completed'],
+  ];
+  const toolbar = '<div class="toolbar"><div class="segmented" role="group" aria-label="Filter campaigns">' +
+    CAMP_FILTERS.map(f => {
+      const n = f[0] === 'all' ? _campaigns.length : _campaigns.filter(c => c.status === f[0]).length;
+      return '<button class="' + (f[0] === _campaignFilter ? 'on' : '') +
+        '" onclick="_campaignFilter=\'' + f[0] + '\';renderCampaigns()">' +
+        f[1] + ' <span class="n">' + n + '</span></button>';
+    }).join('') + '</div></div>';
+  const shown = _campaignFilter === 'all' ? _campaigns : _campaigns.filter(c => c.status === _campaignFilter);
+  if (!shown.length) {
+    el.innerHTML = toolbar + '<div class="card">' +
+      emptyState(icon('campaigns'), 'No campaigns here', 'No campaigns match this filter.') + '</div>';
+    return;
+  }
+  let html = toolbar;
+  shown.forEach((c) => {
+    const i = _campaigns.indexOf(c);
     let stepsHtml = '';
     (c.sequence || []).forEach((step, s) => {
       const sendBtns = (c.recipients || []).map((r, ri) => {
@@ -2532,7 +2940,9 @@ async function loadCampaigns() {
 
 // The whole exchange in order: Sellbird's cold emails (from the Outbox), the
 // replies, Sellbird's answers, and any answer still waiting for approval.
+let _campaignFilter = 'all';
 let _convos = [], _convoFilter = 'needs';
+let _activity = [], _activityAgent = 'all', _activityDate = 'all';
 const STAGE_LABELS = {
   initial_outreach: 'Outreach', engaged: 'Engaged', qualifying: 'Qualifying', presenting: 'Presenting',
   negotiating: 'Negotiating', closing: 'Closing', closed_won: 'Won', closed_lost: 'Lost',
@@ -3070,14 +3480,93 @@ async function loadActivity() {
   const el = document.getElementById('activity-list');
   const data = await api('/api/activity');
   if (!data) { el.innerHTML = offlineState(); return; }
-  if (!data.length) {
-    el.innerHTML = emptyState(icon('activity'), 'No activity yet',
-      'Sellbird hasn\'t taken any actions. Every prospect found, email written, and reply handled will appear here the moment it happens.');
+  _activity = data;
+  renderActivity();
+}
+
+function renderActivity() {
+  const el = document.getElementById('activity-list');
+  if (!el) return;
+
+  // Build date boundary for the date filter
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOf7Days = startOfToday - 6 * 86400000;
+
+  // Count by agent (across all items) for filter badges
+  const agentCounts = {};
+  for (const a of _activity) {
+    if (a.agent && a.agent !== 'main') agentCounts[a.agent] = (agentCounts[a.agent] || 0) + 1;
+  }
+  const knownAgents = ['scout','writer','sender','handler','analyst'].filter(ag => agentCounts[ag]);
+
+  // Apply filters
+  const filtered = _activity.filter(a => {
+    if (_activityAgent !== 'all' && a.agent !== _activityAgent) return false;
+    if (_activityDate !== 'all') {
+      const ts = new Date(a.created_at).getTime();
+      if (_activityDate === 'today' && ts < startOfToday) return false;
+      if (_activityDate === '7d' && ts < startOf7Days) return false;
+    }
+    return true;
+  });
+
+  // Helper: count items matching date filter only (for agent badge counts)
+  const countForAgent = ag => _activity.filter(a => {
+    if (ag !== 'all' && a.agent !== ag) return false;
+    if (_activityDate !== 'all') {
+      const ts = new Date(a.created_at).getTime();
+      if (_activityDate === 'today' && ts < startOfToday) return false;
+      if (_activityDate === '7d' && ts < startOf7Days) return false;
+    }
+    return true;
+  }).length;
+
+  // Helper: count items matching agent filter only (for date badge counts)
+  const countForDate = d => _activity.filter(a => {
+    if (_activityAgent !== 'all' && a.agent !== _activityAgent) return false;
+    if (d !== 'all') {
+      const ts = new Date(a.created_at).getTime();
+      if (d === 'today' && ts < startOfToday) return false;
+      if (d === '7d' && ts < startOf7Days) return false;
+    }
+    return true;
+  }).length;
+
+  const allCount = countForAgent('all');
+  const todayCount = countForDate('today');
+  const sevenCount = countForDate('7d');
+
+  let html = '<div class="toolbar">' +
+    '<div class="segmented" role="group" aria-label="Filter by agent">' +
+    '<button class="' + (_activityAgent === 'all' ? 'on' : '') + '" onclick="_activityAgent=\'all\';renderActivity()">' +
+      'All <span class="n">' + allCount + '</span></button>';
+  for (const ag of knownAgents) {
+    const c = countForAgent(ag);
+    html += '<button class="' + (_activityAgent === ag ? 'on' : '') + '" onclick="_activityAgent=\'' + ag + '\';renderActivity()">' +
+      escHtml(ag.charAt(0).toUpperCase() + ag.slice(1)) + ' <span class="n">' + c + '</span></button>';
+  }
+  html += '</div></div>' +
+    '<div class="toolbar">' +
+    '<div class="segmented" role="group" aria-label="Filter by date">' +
+    '<button class="' + (_activityDate === 'all' ? 'on' : '') + '" onclick="_activityDate=\'all\';renderActivity()">All time <span class="n">' + allCount + '</span></button>' +
+    '<button class="' + (_activityDate === '7d' ? 'on' : '') + '" onclick="_activityDate=\'7d\';renderActivity()">Last 7 days <span class="n">' + sevenCount + '</span></button>' +
+    '<button class="' + (_activityDate === 'today' ? 'on' : '') + '" onclick="_activityDate=\'today\';renderActivity()">Today <span class="n">' + todayCount + '</span></button>' +
+    '</div></div>';
+
+  if (!filtered.length) {
+    if (!_activity.length) {
+      el.innerHTML = html + emptyState(icon('activity'), 'No activity yet',
+        'Sellbird hasn\'t taken any actions. Every prospect found, email written, and reply handled will appear here the moment it happens.');
+    } else {
+      el.innerHTML = html + emptyState(icon('activity'), 'No matching activity', 'Try a different agent or date range.');
+    }
     return;
   }
-  let html = '<div class="card"><div class="timeline">';
+
+  html += '<div class="card"><div class="timeline">';
   let day = '';
-  for (const a of data) {
+  for (const a of filtered) {
     const label = dayLabel(a.created_at);
     if (label !== day) { day = label; html += '<div class="tl-day">' + escHtml(label) + '</div>'; }
     html += '<div class="tl-item' + (a.agent === 'main' ? ' quiet' : '') + '"><span class="tl-time">' + timeOfDay(a.created_at) + '</span>' +
@@ -3085,10 +3574,23 @@ async function loadActivity() {
       '<span class="tl-text">' + actionText(a) + '</span>' +
       '<span class="tl-agent">' + escHtml(a.agent) + '</span></div>';
   }
-  el.innerHTML = html + '</div></div>';
+  html += '</div></div>';
+  el.innerHTML = html;
 }
 
 // ── Init & live refresh ──
+
+// Restore the last-visited tab from the URL hash on page load.
+(function initTabFromHash() {
+  const hash = location.hash.slice(1);
+  const valid = ['today','company','outbox','inboxes','conversations','signals',
+    'discover','companies','prospects','campaigns','activity','usage','controls','settings','help'];
+  if (hash && valid.includes(hash) && hash !== 'today') {
+    const btn = [...document.querySelectorAll('nav button')].find(
+      b => (b.getAttribute('onclick') || '').includes("'" + hash + "'"));
+    showTab(hash, btn || null);
+  }
+})();
 
 loadRenameNotice();
 loadToday();

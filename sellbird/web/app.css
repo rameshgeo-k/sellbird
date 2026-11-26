@@ -37,7 +37,7 @@
   --fs-caption: 0.75rem;     /* 12 */
   --fs-ui:      0.8125rem;   /* 13 */
   --fs-body:    0.875rem;    /* 14 */
-  --fs-lead:    0.9375rem;   /* 15 */
+  --fs-lead:    1rem;        /* 16 */
   --fs-h3:      1rem;        /* 16 */
   --fs-h2:      1.375rem;    /* 22 */
   --fs-kpi:     1.75rem;     /* 28 */
@@ -230,7 +230,7 @@ nav button .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: elli
   nav button:hover { background: var(--surface-2); color: var(--text); }
   nav button:hover .icon { color: var(--text-2); }
 }
-nav button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-border); }
+nav button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-border); border-left: 2px solid var(--accent); padding-left: 8px; }
 nav button.active .icon { color: var(--accent); }
 .nav-count {
   display: none; min-width: 20px; height: 18px; padding: 0 6px;
@@ -508,6 +508,7 @@ tr:focus-within .row-action { opacity: 1; }
 
 /* Table toolbar: search + filters */
 .toolbar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }
+.toolbar + .toolbar { margin-top: calc(-1 * var(--sp-2)); }
 .search {
   position: relative; flex: 1; min-width: 200px; max-width: 320px;
 }
@@ -734,6 +735,79 @@ details[open] > summary::before { rotate: 45deg; }
   .desk-list { max-height: 240px; }
   .desk-context { grid-template-columns: minmax(0, 1fr); }
   .desk-pane { padding: var(--sp-4); }
+}
+
+/* ── Outbox: email preview frame ── */
+.email-frame { margin: var(--sp-4) 0; border: 1px solid var(--line-strong); border-radius: var(--r-lg); overflow: hidden; }
+.email-frame.editing { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ef-header { padding: var(--sp-4) var(--sp-5); background: var(--surface-2); border-bottom: 1px solid var(--line); }
+.ef-subject { font-size: 1.1rem; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+.ef-body { padding: var(--sp-5); }
+.email-frame .desk-edit-subject { margin-top: 0; border: none; padding: 0; background: transparent; border-radius: 0; }
+.email-frame .desk-edit-body   { margin-top: 0; border: none; padding: 0; background: transparent; border-radius: 0; }
+.email-frame .desk-edit-subject:focus, .email-frame .desk-edit-body:focus { outline: none; box-shadow: none; }
+
+/* ── Outbox: prev/next nav ── */
+.desk-nav { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.desk-nav-count { font-size: var(--fs-caption); color: var(--text-3); padding: 0 var(--sp-2); min-width: 4em; text-align: center; white-space: nowrap; }
+
+/* ── Outbox: rail item details ── */
+.di-row1 { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.di-row1 .to { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.di-step { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: var(--r-sm); background: var(--surface-2); color: var(--text-3); flex-shrink: 0; letter-spacing: 0.03em; }
+.desk-item.active .di-step { background: var(--accent); color: var(--accent-text); }
+.di-when { font-size: 10px; color: var(--text-3); margin-top: 2px; }
+.di-held-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--wait); flex-shrink: 0; display: inline-block; }
+.desk-item.held-item { border-left: 2px solid var(--wait-line); }
+
+/* ── Outbox: context section label ── */
+.desk-context-head { font-size: var(--fs-caption); font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); margin: var(--sp-4) 0 var(--sp-2); }
+
+/* ── Outbox: reject danger tint ── */
+.desk-reject { color: var(--bad); }
+@media (hover: hover) { .desk-reject:hover:not(:disabled) { background: var(--bad-bg); border-color: var(--bad-line); } }
+
+/* ── Outbox: pending table view ── */
+.ot-row { cursor: pointer; }
+.ot-row td { vertical-align: top; }
+.ot-row.ot-held { background: var(--wait-bg); }
+@media (hover: hover) { .ot-row:hover td { background: var(--surface-2); } .ot-row.ot-held:hover td { background: var(--wait-bg); } }
+.ot-who { font-size: var(--fs-ui); font-weight: 500; white-space: nowrap; }
+.ot-addr { font-size: var(--fs-caption); color: var(--text-3); }
+.ot-subject { font-size: var(--fs-ui); font-weight: 500; }
+.snippet { font-size: var(--fs-caption); color: var(--text-3); max-width: 38ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ot-acts { white-space: nowrap; }
+.ot-btn-group { display: flex; gap: var(--sp-2); align-items: center; }
+.pager { display: flex; align-items: center; gap: var(--sp-3); justify-content: center; margin-top: var(--sp-3); }
+.pager-info { font-size: var(--fs-ui); color: var(--text-3); min-width: 8em; text-align: center; }
+
+/* ── Outbox: email preview modal ── */
+@keyframes ob-fade-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.ob-modal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(2px);
+  display: flex; align-items: flex-end; justify-content: center;
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+@media (min-width: 640px) { .ob-modal { align-items: center; padding: var(--sp-6); } }
+.ob-modal-inner {
+  background: var(--surface); border-radius: var(--r-lg);
+  box-shadow: 0 24px 64px rgba(0,0,0,.28), var(--shadow-border);
+  width: min(700px, 100%); max-height: 90vh;
+  display: flex; flex-direction: column; overflow: hidden;
+  animation: ob-fade-in 160ms ease;
+}
+.ob-modal-head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6);
+  border-bottom: 1px solid var(--line); flex-shrink: 0;
+}
+.ob-modal-head .to-line { flex: 1; }
+.ob-modal-body { overflow-y: auto; padding: var(--sp-5) var(--sp-6); flex: 1; overscroll-behavior: contain; }
+.ob-modal-body .email-frame { margin-top: var(--sp-3); }
+.ob-modal-foot {
+  display: flex; gap: var(--sp-2); align-items: center;
+  padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--line); flex-shrink: 0;
 }
 
 .banner {

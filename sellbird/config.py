@@ -696,7 +696,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "ollama")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -716,6 +716,9 @@ class BrainConfig(BaseModel):
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
     reasoning_effort: str = ""  # codex only; empty = model default
+    fallback_provider: str = ""  # "ollama" to fall back when primary is unavailable
+    fallback_model: str = ""     # e.g. "gpt-oss:latest"; empty = Ollama's default
+    ollama_url: str = "http://localhost:11434"
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -724,6 +727,17 @@ class BrainConfig(BaseModel):
         if v not in BRAIN_PROVIDERS:
             raise ValueError(
                 f"'{v}' is not a supported brain provider. "
+                f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
+            )
+        return v
+
+    @field_validator("fallback_provider", mode="before")
+    @classmethod
+    def _valid_fallback_provider(cls, v) -> str:
+        v = str(v or "").strip().lower()
+        if v and v not in BRAIN_PROVIDERS:
+            raise ValueError(
+                f"'{v}' is not a supported fallback provider. "
                 f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
             )
         return v

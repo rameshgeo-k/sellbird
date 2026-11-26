@@ -40,7 +40,7 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "ollama": "Ollama"}
 
 # Settings key holding the brain's last health transition, for `sellbird
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -94,6 +94,51 @@ def _read_knowledge(folder: str, name: str) -> str:
         if shipped is None or (shipped / folder / f"{name}.md") == own:
             raise
         return read_user_text(shipped / folder / f"{name}.md")
+
+
+class OllamaTransport:
+    """Async transport that calls a local Ollama instance.
+
+    Fits the Brain transport interface: ``async (prompt, *, agent, task,
+    timeout, expect_json) -> str``. Returns "" on any failure so Brain's
+    normal empty-reply handling applies.
+    """
+
+    paused_reason = ""  # always available locally; never self-pauses
+
+    def __init__(self, model: str = "", url: str = "http://localhost:11434"):
+        self.model = model
+        self.url = url.rstrip("/")
+
+    async def __call__(
+        self,
+        prompt: str,
+        *,
+        agent: str = "",
+        task: str = "",
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        expect_json: bool = False,
+    ) -> str:
+        import httpx
+
+        payload: dict = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        if expect_json:
+            payload["format"] = "json"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{self.url}/v1/chat/completions",
+                    json=payload,
+                )
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"] or ""
+        except Exception as e:
+            logger.warning(f"Ollama call failed ({agent}/{task}): {type(e).__name__}: {e}")
+            return ""
 
 
 class Brain:
@@ -166,6 +211,8 @@ class Brain:
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
+        if self.provider == "ollama":
+            return await self._ollama_preflight()
         if self.provider != "codex":
             return await self._claude_preflight()
         from sellbird.codex import CodexError
@@ -221,6 +268,17 @@ class Brain:
         if self.unavailable:
             await self._mark_available()
         return ""
+
+    async def _ollama_preflight(self) -> str:
+        """Ollama: ping the local server. Returns "" when reachable."""
+        import httpx
+        url = getattr(self.transport, "url", "http://localhost:11434") if self.transport else "http://localhost:11434"
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(f"{url}/api/tags")
+            return ""
+        except Exception as e:
+            return f"Ollama not reachable at {url}: {e}"
 
     def _fingerprint(self):
         if self.provider == "codex":

@@ -318,6 +318,22 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     handler = Handler(brain, state, config, env)
     analyst = Analyst(state)
 
+    # Build a fallback brain backed by local Ollama when configured.
+    fallback_brain = None
+    if config.brain.fallback_provider == "ollama":
+        from sellbird.brain import OllamaTransport
+        from sellbird.config import BrainConfig as _BrainConfig
+        _ollama_transport = OllamaTransport(
+            model=config.brain.fallback_model,
+            url=config.brain.ollama_url,
+        )
+        fallback_brain = Brain(state, _BrainConfig(provider="ollama"),
+                               transport=_ollama_transport)
+        logger.info(
+            f"Ollama fallback configured: {config.brain.fallback_model or 'default model'} "
+            f"at {config.brain.ollama_url}"
+        )
+
     interval = config.usage.heartbeat_interval_minutes * 60
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
     consecutive_errors = 0
@@ -365,33 +381,59 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     break
                 continue
 
-            # 2. Is the brain usable at all? (Codex: CLI version, isolation,
-            # login, account and model checked without a prompt.) If not, do nothing
-            # this cycle — no replies consumed, nothing written or sent —
-            # and say why, rather than running agents that would each fail.
+            # 2. Is the primary brain usable? If not, try Ollama fallback.
+            # When neither is available, run reflex only (drain the approved
+            # outbox — purely mechanical, no model call) so approved emails
+            # still go out even during an outage.
+            active_brain = brain
             problem = await brain.preflight()
             if problem:
-                logger.error(
-                    f"Sellbird is paused: {problem} Nothing was sent or changed. "
-                    f"Re-checking in {config.usage.heartbeat_interval_minutes} minutes."
-                )
-                if await _interruptible_sleep(interval, stop_event):
-                    break
-                continue
+                if fallback_brain and not (await fallback_brain.preflight()):
+                    logger.warning(
+                        f"Primary brain unavailable ({problem}). "
+                        "Falling back to Ollama for this cycle."
+                    )
+                    active_brain = fallback_brain
+                else:
+                    logger.error(
+                        f"Sellbird brain unavailable: {problem} "
+                        "Running reflex only (outbox drain) this cycle."
+                    )
+                    if sender.is_native:
+                        await _run_agents([("send_outbox", sender.run())])
+                    consecutive_errors = 0
+                    if await _interruptible_sleep(interval, stop_event):
+                        break
+                    continue
 
-            # 3. Check usage budget (real subscription quota when readable,
-            # else Sellbird's own call counter)
-            if not await brain.is_within_budget(
+            # 3. Check usage budget (applies to the primary brain only;
+            # Ollama is local so no quota applies to it).
+            if active_brain is brain and not await brain.is_within_budget(
                 max_calls, max_percent=config.usage.max_daily_claude_percent
             ):
-                logger.info(
-                    f"{brain.provider_label} usage limit reached "
-                    f"({config.usage.max_daily_claude_percent}% of quota or "
-                    f"{max_calls} calls). Sleeping 1h, then re-checking."
-                )
-                if await _interruptible_sleep(3600, stop_event):
-                    break
-                continue
+                if fallback_brain and not (await fallback_brain.preflight()):
+                    logger.warning(
+                        f"{brain.provider_label} quota reached. "
+                        "Falling back to Ollama for this cycle."
+                    )
+                    active_brain = fallback_brain
+                else:
+                    logger.info(
+                        f"{brain.provider_label} usage limit reached "
+                        f"({config.usage.max_daily_claude_percent}% of quota or "
+                        f"{max_calls} calls). Running reflex only this cycle."
+                    )
+                    if sender.is_native:
+                        await _run_agents([("send_outbox", sender.run())])
+                    if await _interruptible_sleep(3600, stop_event):
+                        break
+                    continue
+
+            # Point agents at whichever brain is active this cycle.
+            if active_brain is not brain:
+                scout.brain = active_brain
+                writer.brain = active_brain
+                handler.brain = active_brain
 
             # 4. Decide what to do (in quiet hours: only read replies and send)
             if send_only:
@@ -451,7 +493,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if send_tasks:
                 unread = [n for n, _ in tasks
                           if n in REPLY_READERS and outcomes.get(n) is not True]
-                paused = brain.paused_reason
+                paused = active_brain.paused_reason
                 if paused or unread:
                     reason = paused or "replies couldn't all be read and handled."
                     logger.error(
@@ -474,6 +516,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # 7. Extensions' tick steps (sellbird.extensions). Each is
             # isolated: a failing step is logged and never stops the loop.
             await run_tick_steps(config, state)
+
+            # Restore agents to the primary brain for the next cycle so a
+            # transient Ollama fallback doesn't persist beyond this cycle.
+            if active_brain is not brain:
+                scout.brain = brain
+                writer.brain = brain
+                handler.brain = brain
 
             consecutive_errors = 0
 
