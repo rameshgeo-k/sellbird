@@ -401,14 +401,17 @@ function toggleVisibility(inputId) {
 
 // ── Tabs ──
 
-function showTab(id, btn) {
+function showTab(id, btn, replace) {
   currentTab = id;
   if (id === 'companies') companyDrill = false;
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if (btn) btn.classList.add('active');
-  try { history.replaceState(null, '', '#' + id); } catch {}
+  try {
+    if (replace) history.replaceState(null, '', '#' + id);
+    else history.pushState(null, '', '#' + id);
+  } catch {}
   loadCurrentTab();
 }
 
@@ -3580,17 +3583,27 @@ function renderActivity() {
 
 // ── Init & live refresh ──
 
+const TAB_IDS = ['today','company','outbox','inboxes','conversations','signals',
+  'discover','companies','prospects','campaigns','activity','usage','controls','settings','help'];
+
 // Restore the last-visited tab from the URL hash on page load.
 (function initTabFromHash() {
   const hash = location.hash.slice(1);
-  const valid = ['today','company','outbox','inboxes','conversations','signals',
-    'discover','companies','prospects','campaigns','activity','usage','controls','settings','help'];
-  if (hash && valid.includes(hash) && hash !== 'today') {
+  if (hash && TAB_IDS.includes(hash) && hash !== 'today') {
     const btn = [...document.querySelectorAll('nav button')].find(
       b => (b.getAttribute('onclick') || '').includes("'" + hash + "'"));
-    showTab(hash, btn || null);
+    showTab(hash, btn || null, true);  // replace so the initial load doesn't push an extra history entry
   }
 })();
+
+// Browser back / forward — activate the tab the URL now points at.
+window.addEventListener('popstate', function() {
+  const hash = location.hash.slice(1);
+  const id = TAB_IDS.includes(hash) ? hash : 'today';
+  const btn = [...document.querySelectorAll('nav button')].find(
+    b => (b.getAttribute('onclick') || '').includes("'" + id + "'"));
+  showTab(id, btn || null, true);  // URL already updated by the browser; replace keeps history intact
+});
 
 loadRenameNotice();
 loadToday();

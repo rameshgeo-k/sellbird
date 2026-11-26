@@ -19,8 +19,11 @@ const AUTH_TOKEN_RE = /^[A-Za-z0-9_-]{43,128}$/;
   const hash = window.location.hash || '';
   if (!hash) return;
   const token = new URLSearchParams(hash.slice(1)).get('token');
+  // Leave the hash intact when it's a tab name, not a token — initTabFromHash
+  // in app.js reads it on page load to restore the active tab.
+  if (!token) return;
   history.replaceState(null, '', window.location.pathname + window.location.search);
-  if (token && AUTH_TOKEN_RE.test(token)) setAuthToken(token);
+  if (AUTH_TOKEN_RE.test(token)) setAuthToken(token);
 })();
 
 function authToken() {
