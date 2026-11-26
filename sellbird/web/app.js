@@ -2995,6 +2995,14 @@ function renderConversations() {
   el.innerHTML = bar + shown.map(convoCard).join('');
 }
 
+function toggleConvo(id) {
+  const el = document.getElementById('convo-' + id);
+  if (!el) return;
+  const open = el.classList.toggle('open');
+  const btn = el.querySelector('.convo-head');
+  if (btn) btn.setAttribute('aria-expanded', String(open));
+}
+
 function convoCard(c) {
   const items = (c.emails || []).map(e => ({ts: e.sent_at, email: e}))
     .concat((c.thread || []).map(m => ({ts: m.timestamp, msg: m})))
@@ -3021,15 +3029,40 @@ function convoCard(c) {
     : '';
   const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || c.company || 'Unknown';
   const stage = own(STAGE_LABELS, c.stage) ? '<span class="tag">' + STAGE_LABELS[c.stage] + '</span>' : '';
-  return '<div class="convo-card"><div class="convo-head">' +
-    '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
-    '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
-      escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
-    // An escalation's intent badge says the same as its status: show one.
-    '<div class="tags">' + (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
-      stage + badge(c.status) + '</div></div>' +
-    '<div class="thread">' + (thread || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
-    draft + '</div>' + convoActions(c) + '</div>';
+
+  // Last-message snippet shown in the collapsed header row.
+  const lastItem = items[items.length - 1];
+  let previewText = '';
+  if (lastItem) {
+    if (lastItem.email) previewText = lastItem.email.body || '';
+    else if (lastItem.msg) previewText = lastItem.msg.content || '';
+  }
+  const preview = previewText
+    ? '<div class="convo-preview">' + escHtml(previewText.slice(0, 140).replace(/\s+/g, ' ')) + '</div>'
+    : '';
+
+  // Start open when the conversation needs a decision.
+  const open = c.status === 'needs_human' || !!c.draft;
+
+  return '<div class="convo-card' + (open ? ' open' : '') + '" id="convo-' + escHtml(c.id) + '">' +
+    '<button class="convo-head" onclick="toggleConvo(' + jsq(c.id) + ')" aria-expanded="' + open + '">' +
+      '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
+      '<div>' +
+        '<h3>' + escHtml(name) + '</h3>' +
+        '<div class="sub">' + escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div>' +
+        preview +
+      '</div>' +
+      // An escalation's intent badge says the same as its status: show one.
+      '<div class="tags">' + (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
+        stage + badge(c.status) + '</div>' +
+      icon('chevron', 'convo-chevron') +
+    '</button>' +
+    '<div class="convo-thread">' +
+      '<div class="thread">' + (thread || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
+      draft + '</div>' +
+      convoActions(c) +
+    '</div>' +
+  '</div>';
 }
 
 // Sellbird answers new replies only on open conversations: an escalated one
