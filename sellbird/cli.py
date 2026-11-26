@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import subprocess
 import sys
 import textwrap
@@ -203,6 +204,17 @@ def cmd_dashboard(args):
     try:
         if getattr(args, "url", False):
             # The unlock link for an already-running dashboard.
+            print(dashboard_url(host=args.host, port=args.port))
+            return
+        if getattr(args, "detach", False):
+            cmd = [sys.executable, "-m", "sellbird", "dashboard",
+                   "--host", args.host, "--port", str(args.port)]
+            flags = 0
+            if os.name == "nt":
+                flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(cmd, creationflags=flags,
+                             close_fds=True, start_new_session=(os.name != "nt"))
+            import time; time.sleep(1)  # give server a moment to bind
             print(dashboard_url(host=args.host, port=args.port))
             return
         start_dashboard(host=args.host, port=args.port)
@@ -1169,6 +1181,8 @@ def main():
     sub.add_argument("--port", type=int, default=5555, help="Port (default: 5555)")
     sub.add_argument("--url", action="store_true",
                      help="Print the unlock link (with its token) and exit")
+    sub.add_argument("--detach", action="store_true",
+                     help="Start in the background so closing this terminal doesn't stop it")
     sub.set_defaults(func=cmd_dashboard)
 
     # sellbird status

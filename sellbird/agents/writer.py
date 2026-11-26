@@ -86,6 +86,16 @@ def _names(prospect) -> list[str]:
 NATIVE_BATCH_CAP = 8
 LEGACY_BATCH_CAP = 50
 
+_SEARCH_OP = re.compile(r'\s+-\w+:.*$', re.DOTALL)
+
+
+def _readable_industry(raw: str) -> str:
+    """Strip web-search operators and search quotes from an industry label."""
+    import re as _re
+    cleaned = _SEARCH_OP.sub('', raw).replace('"', '').replace("'", '')
+    cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
+    return (cleaned[:60] if len(cleaned) > 60 else cleaned) or raw
+
 # The built-in "how" lines each prompt ends with: email 1 is an observation
 # and a question, with no pitch. Operator email rules replace exactly these.
 PERSONAL_SHAPE = f"""- 60 words at most, and aim for 30-50. Every word you cut raises the reply rate.
@@ -877,7 +887,7 @@ Return ONLY a JSON object: {{"subject": "...", "body": "..."}}"""
 
         for prospect in prospects:
             # Group by industry + rough title category
-            industry = prospect.industry or "general"
+            industry = _readable_industry(prospect.industry or "general")
             # Inbox prospects get their own campaign: their templates can't
             # greet anyone by name.
             kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
